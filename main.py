@@ -173,7 +173,7 @@ def notification_handler(sender, data):
 
     if yaw > 90 and not triggered_right:
 
-        print("\nfire walk with me\n")
+        print("\nFire walk with me\n")
 
         triggered_right = True
 
@@ -187,7 +187,7 @@ def notification_handler(sender, data):
 
     if yaw < -90 and not triggered_left:
 
-        print("\nfire walk with me\n")
+        print("\nWho killed Laura Palmer??\n")
 
         triggered_left = True
 

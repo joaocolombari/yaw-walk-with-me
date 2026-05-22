@@ -3,6 +3,8 @@ import struct
 import math
 import nest_asyncio
 import numpy as np
+import sounddevice as sd
+import soundfile as sf
 
 from qasync import QEventLoop
 from bleak import BleakScanner, BleakClient
@@ -33,6 +35,25 @@ tare_quaternion = None
 
 triggered_left = False
 triggered_right = False
+
+ATTENTION_SIGMA = 20
+
+sources = [
+    {"name":"Laura", "pos":np.array([3.,-3.,0.]), "file":"laura.mp3"},
+    {"name":"Coop", "pos":np.array([3.,3.,0.]), "file":"cooper.mp3"}]
+
+audio=[]
+
+for s in sources:
+
+    x, fs = sf.read(s["file"], dtype="float32")
+
+    if x.ndim > 1:
+        x = x.mean(axis=1)
+    audio.append(x)
+
+FS = fs
+positions = [0 for _ in sources]
 
 # ============================================================
 # QUATERNION -> EULER
@@ -108,13 +129,43 @@ def quaternion_multiply(q1, q2):
     return (
 
         w1*w2 - x1*x2 - y1*y2 - z1*z2,
-
         w1*x2 + x1*w2 + y1*z2 - z1*y2,
-
         w1*y2 - x1*z2 + y1*w2 + z1*x2,
-
         w1*z2 + x1*y2 - y1*x2 + z1*w2
     )
+
+# ============================================================
+# AUDIO CALLBACK
+# ============================================================
+
+def audio_callback(outdata, frames, time, status):
+
+    mix = np.zeros(frames)
+    attention = compute_attention(latest_quaternion)
+
+    for i, (_, att) in enumerate(attention):
+
+        gain = att / 100.0
+
+        p0 = positions[i]
+        p1 = p0 + frames
+
+        chunk = audio[i]
+
+        if p1 > len(chunk):
+            p1 = len(chunk)
+
+        segment = chunk[p0:p1]
+
+        if len(segment) < frames:
+            segment = np.pad(segment, (0, frames-len(segment)))
+
+        mix += gain * segment
+        positions[i] = (p1 % len(chunk))
+
+    mix /= max(np.max(np.abs(mix)), 1)
+    
+    outdata[:] = mix.reshape(-1, 1)
 
 # ============================================================
 # BLE CALLBACK
@@ -133,33 +184,20 @@ def notification_handler(sender, data):
 
     q_raw = struct.unpack("<ffff", data)
 
-    # ========================================================
-    # TARE INICIAL
-    # ========================================================
+    # Here it works as a tare for forward direction
 
     if tare_quaternion is None:
-
         tare_quaternion = quaternion_conjugate(q_raw)
-
         print("\nForward direction calibrated.\n")
 
-    # ========================================================
-    # APLICA TARE
-    # ========================================================
-
     q = quaternion_multiply(tare_quaternion, q_raw)
-
     latest_quaternion = q
 
-    # ========================================================
-    # EULER APENAS PARA DETECÇÃO
-    # ========================================================
+    # Euler just for detection
 
     roll, pitch, yaw = quaternion_to_euler(*q)
 
-    # ========================================================
-    # NORMALIZA YAW
-    # ========================================================
+    # Normalizes Yaw
 
     while yaw > 180:
         yaw -= 360
@@ -167,33 +205,55 @@ def notification_handler(sender, data):
     while yaw < -180:
         yaw += 360
 
-    # ========================================================
-    # DETECÇÃO DIREITA
-    # ========================================================
+    # Computes attention
+    #
+    # Each Virtual Sound Object (VSO) occupies a fixed position
+    # in 3D space:
+    #
+    #     source = (x,y,z)
+    #
+    # The head orientation quaternion defines a forward unit
+    # vector representing the user's instantaneous attention axis.
+    #
+    # For each source:
+    #
+    # 1) Compute source direction:
+    #
+    #       s = source / ||source||
+    #
+    # 2) Compute head direction:
+    #
+    #       h = rotate(q,[1,0,0])
+    #
+    # 3) Compute angular distance:
+    #
+    #       θ = arccos(h·s)
+    #
+    # 4) Convert angle into probabilistic attention:
+    #
+    #       A = exp(-θ²/(2σ²))
+    #
+    # where:
+    #
+    #       A ∈ [0,1]
+    #       σ = attentional spread (degrees)
+    #
+    # Final output:
+    #
+    #       attention = 100·A
+    #
+    # This creates a continuous spatial attention field instead
+    # of threshold-based selection.
+    #
+    # ============================================================
 
-    if yaw > 90 and not triggered_right:
+    attention = compute_attention(q)
+    text=[]
 
-        print("\nFire walk with me\n")
+    for name, value in attention:
+        text.append(f"{name}: {value:.1f}%")
 
-        triggered_right = True
-
-    if yaw < 70:
-
-        triggered_right = False
-
-    # ========================================================
-    # DETECÇÃO ESQUERDA
-    # ========================================================
-
-    if yaw < -90 and not triggered_left:
-
-        print("\nWho killed Laura Palmer??\n")
-
-        triggered_left = True
-
-    if yaw > -70:
-
-        triggered_left = False
+    print("\r" + " | ".join(text), end="")
 
 # ============================================================
 # FIND DEVICE
@@ -202,18 +262,13 @@ def notification_handler(sender, data):
 async def find_device():
 
     print("Scanning for BLE devices...\n")
-
     devices = await BleakScanner.discover(timeout=5.0)
 
     for d in devices:
-
         if d.name and DEVICE_NAME in d.name:
-
             print(f"Found device: {d.name}")
             print(f"Address: {d.address}")
-
             return d
-
     return None
 
 # ============================================================
@@ -223,7 +278,6 @@ async def find_device():
 async def ble_task():
 
     device = await find_device()
-
     if device is None:
         print("Device not found.")
         return
@@ -231,14 +285,10 @@ async def ble_task():
     print("\nConnecting...\n")
 
     async with BleakClient(device) as client:
-
         print("Connected.")
         print("Receiving head orientation...\n")
 
-        await client.start_notify(
-            CHAR_UUID,
-            notification_handler
-        )
+        await client.start_notify(CHAR_UUID, notification_handler)
 
         while True:
             await asyncio.sleep(0.01)
@@ -257,11 +307,8 @@ if app is None:
 # ============================================================
 
 view = gl.GLViewWidget()
-
 view.show()
-
 view.setWindowTitle("David Lynch Head Tracking")
-
 view.setCameraPosition(distance=5)
 
 # ============================================================
@@ -269,9 +316,7 @@ view.setCameraPosition(distance=5)
 # ============================================================
 
 grid = gl.GLGridItem()
-
 grid.scale(1, 1, 1)
-
 view.addItem(grid)
 
 # ============================================================
@@ -279,9 +324,7 @@ view.addItem(grid)
 # ============================================================
 
 axis = gl.GLAxisItem()
-
 axis.setSize(1, 1, 1)
-
 view.addItem(axis)
 
 # ============================================================
@@ -289,19 +332,15 @@ view.addItem(axis)
 # ============================================================
 
 your_mesh = mesh.Mesh.from_file(STL_FILE)
-
 vertices = your_mesh.vectors.reshape(-1, 3)
-
 faces = np.arange(vertices.shape[0]).reshape(-1, 3)
 
 # center object
 center = vertices.mean(axis=0)
-
 vertices -= center
 
 # normalize scale
 scale = np.max(np.linalg.norm(vertices, axis=1))
-
 vertices /= scale
 
 # optional scale factor
@@ -311,30 +350,35 @@ vertices *= 2.0
 # CREATE GL MESH
 # ============================================================
 
-meshdata = gl.MeshData(
-    vertexes=vertices,
-    faces=faces
-)
-
-head_mesh = gl.GLMeshItem(
-    meshdata=meshdata,
-    smooth=True,
-    drawEdges=False,
-    shader='shaded',
-)
-
+meshdata = gl.MeshData(vertexes=vertices, faces=faces)
+head_mesh = gl.GLMeshItem(meshdata=meshdata,smooth=True,drawEdges=False,shader='shaded',)
 view.addItem(head_mesh)
 
 # ============================================================
-# FORWARD VECTOR
+# FORWARD VECTOR and sources
 # ============================================================
 
-forward_line = gl.GLLinePlotItem(
-    width=4,
-    antialias=True
-)
-
+forward_line = gl.GLLinePlotItem(width=4, antialias=True)
 view.addItem(forward_line)
+
+source_points = []
+source_lines = []
+
+for s in sources:
+
+    p = np.array([s["pos"]])
+    point = gl.GLScatterPlotItem(pos=p, size=30)
+
+    view.addItem(point)
+    source_points.append(point)
+    line = gl.GLLinePlotItem(pos=np.array([[0,0,0], s["pos"]]), width=1)
+    view.addItem(line)
+    source_lines.append(line)
+
+for s in sources:
+
+    item = gl.GLScatterPlotItem(pos=np.array([s["pos"]]), size=20)
+    view.addItem(item)
 
 # ============================================================
 # UPDATE VISUAL
@@ -343,44 +387,46 @@ view.addItem(forward_line)
 def quat_rotate(q, v):
 
     w, x, y, z = q
-
     qvec = np.array([x, y, z])
-
     uv = np.cross(qvec, v)
     uuv = np.cross(qvec, uv)
-
     return v + 2 * (w * uv + uuv)
 
 def update_visual():
 
     q = latest_quaternion
 
-    # ========================================================
-    # ROTATE HEAD
-    # ========================================================
-
+    # Rotates head
     rot = quaternion_to_matrix(q)
-
     transform = QMatrix4x4(*rot.flatten())
-
     head_mesh.resetTransform()
-
     head_mesh.setTransform(transform)
 
-    # ========================================================
-    # FORWARD VECTOR
-    # ========================================================
-
+    # Forward vector
     forward = quat_rotate(q, np.array([1, 0, 0]))
-
     origin = np.array([0, 0, 0])
+    forward_line.setData(pos=np.array([origin, forward * 3]))
 
-    forward_line.setData(
-        pos=np.array([
-            origin,
-            forward * 3
-        ])
-    )
+# ============================================================
+# ATTENTION COMPUTATION
+# ============================================================
+
+def compute_attention(q):
+
+    forward = quat_rotate(q, np.array([1.0,0.0,0.0]))
+    forward /= np.linalg.norm(forward)
+    values=[]
+
+    for s in sources:
+        direction = s["pos"]
+        direction /= np.linalg.norm(direction)
+        angle = np.degrees(np.arccos(np.clip(np.dot(forward, direction), -1.0, 1.0)))
+
+        attention = np.exp(-(angle**2)/(2*ATTENTION_SIGMA**2))
+
+        values.append((s["name"], 100*attention))
+
+    return values
 
 # ============================================================
 # TIMER
@@ -401,6 +447,10 @@ loop = QEventLoop(app)
 asyncio.set_event_loop(loop)
 
 loop.create_task(ble_task())
+
+stream = sd.OutputStream(samplerate=FS, channels=1, callback=audio_callback, blocksize=1024)
+
+stream.start()
 
 with loop:
     loop.run_forever()

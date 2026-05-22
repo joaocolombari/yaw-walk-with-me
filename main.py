@@ -55,6 +55,13 @@ for s in sources:
 FS = fs
 positions = [0 for _ in sources]
 
+# Binaural config
+HEAD_RADIUS = 0.0875
+MAX_ITD = 0.0007
+
+# Calculate the maximum sample delay and add a 2-sample safety buffer
+MAX_SHIFT_SAMPLES = int(math.ceil(MAX_ITD * FS)) + 2
+
 # ============================================================
 # QUATERNION -> EULER
 # ============================================================
@@ -139,33 +146,55 @@ def quaternion_multiply(q1, q2):
 # ============================================================
 
 def audio_callback(outdata, frames, time, status):
+    try:
+        mix = np.zeros((frames, 2), dtype=np.float32)
+        attention = compute_attention(latest_quaternion)
 
-    mix = np.zeros(frames)
-    attention = compute_attention(latest_quaternion)
+        if not hasattr(audio_callback, "prev_gain"):
+            audio_callback.prev_gain = [0.0 for _ in sources]
+            audio_callback.prev_az = [0.0 for _ in sources]
 
-    for i, (_, att) in enumerate(attention):
+        alpha = 0.98
 
-        gain = att / 100.0
+        for i, (_, att) in enumerate(attention):
+            
+            # Calculate Gain
+            prev_gain = audio_callback.prev_gain[i]
+            target_gain = (alpha * prev_gain + (1 - alpha) * float(att) / 100)
+            audio_callback.prev_gain[i] = target_gain
+            
+            gain_ramp = np.linspace(prev_gain, target_gain, frames, dtype=np.float32)[:, None]
 
-        p0 = positions[i]
-        p1 = p0 + frames
+            # Get Audio Chunk WITH history using np.take
+            chunk = audio[i]
+            p0 = positions[i]
+            
+            # Request history samples + current frames, wrapping around edges automatically
+            indices = np.arange(p0 - MAX_SHIFT_SAMPLES, p0 + frames)
+            segment = np.take(chunk, indices, mode='wrap')
 
-        chunk = audio[i]
+            # Update playhead position for the next callback
+            positions[i] = (p0 + frames) % len(chunk)
 
-        if p1 > len(chunk):
-            p1 = len(chunk)
+            # Calculate Azimuth
+            target_az = source_relative_angle(latest_quaternion, sources[i]["pos"])
+            prev_az = audio_callback.prev_az[i]
+            audio_callback.prev_az[i] = target_az
 
-        segment = chunk[p0:p1]
+            # Spatialize (pass frames to let the function know the target block size)
+            stereo = spatialize(segment, target_az, prev_az, frames)
+            
+            mix += gain_ramp * stereo
 
-        if len(segment) < frames:
-            segment = np.pad(segment, (0, frames-len(segment)))
+        peak = np.max(np.abs(mix))
+        if peak > 1:
+            mix /= peak
 
-        mix += gain * segment
-        positions[i] = (p1 % len(chunk))
+        outdata[:] = mix
 
-    mix /= max(np.max(np.abs(mix)), 1)
-    
-    outdata[:] = mix.reshape(-1, 1)
+    except Exception as e:
+        print("\nAudio error:", e)
+        outdata.fill(0)
 
 # ============================================================
 # BLE CALLBACK
@@ -429,6 +458,63 @@ def compute_attention(q):
     return values
 
 # ============================================================
+# SOURCE POSITION IN HEAD FRAME
+# ============================================================
+
+def source_relative_angle(q, pos):
+
+    q_inv = quaternion_conjugate(q)
+    source = pos.astype(np.float32)
+    source /= np.linalg.norm(source)
+    relative = quat_rotate(q_inv, source)
+
+    az = np.degrees(
+        np.arctan2(relative[1], relative[0]))
+
+    return az
+
+# ============================================================
+# DYNAMIC BINAURAL RENDERER
+# ============================================================
+
+def spatialize(segment, target_az, prev_az, frames):
+    # Unwrap azimuth to prevent sweeping the wrong way
+    if target_az - prev_az > 180:
+        prev_az += 360
+    elif target_az - prev_az < -180:
+        prev_az -= 360
+
+    # 1. Ramp the azimuth smoothly across the audio block
+    az_ramp = np.linspace(prev_az, target_az, frames)
+    az_ramp = np.radians(np.clip(az_ramp, -90, 90))
+
+    # 2. Smooth ITD (Delay)
+    itd_ramp = MAX_ITD * np.sin(az_ramp)
+    shift_ramp = itd_ramp * FS
+
+    left_shift = np.maximum(0, -shift_ramp)
+    right_shift = np.maximum(0, shift_ramp)
+
+    # 3. Interpolate RAW audio with history buffer
+    # The "current" block starts after the history samples
+    idx = np.arange(frames) + MAX_SHIFT_SAMPLES
+    seg_idx = np.arange(len(segment))
+
+    # Because segment contains history, idx - shift will look back into valid audio
+    raw_left = np.interp(idx - left_shift, seg_idx, segment)
+    raw_right = np.interp(idx - right_shift, seg_idx, segment)
+
+    # 4. Equal Power Panning (ILD)
+    theta = (az_ramp + np.pi/2) / 2
+    left_gain = np.sin(theta)
+    right_gain = np.cos(theta)
+
+    left = raw_left * left_gain
+    right = raw_right * right_gain
+
+    return np.column_stack([left, right])
+
+# ============================================================
 # TIMER
 # ============================================================
 
@@ -448,7 +534,7 @@ asyncio.set_event_loop(loop)
 
 loop.create_task(ble_task())
 
-stream = sd.OutputStream(samplerate=FS, channels=1, callback=audio_callback, blocksize=1024)
+stream = sd.OutputStream(samplerate=FS, channels=2, callback=audio_callback, blocksize=512)
 
 stream.start()
 

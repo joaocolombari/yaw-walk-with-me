@@ -1,4 +1,3 @@
-# main.py
 import asyncio
 import struct
 import math
@@ -6,6 +5,11 @@ import nest_asyncio
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
+from scipy.signal import resample
+
+# New imports for thread-safe background recording
+import queue
+import threading
 
 from qasync import QEventLoop
 from bleak import BleakScanner, BleakClient
@@ -25,6 +29,7 @@ nest_asyncio.apply()
 DEVICE_NAME = "Tiresias_DK"
 CHAR_UUID = "12345678-1234-5678-1234-56789abcdef1"
 STL_FILE = "david-lynch.stl"
+RECORDING_FILENAME = "spatial_output.wav"  # Output file name
 
 latest_quaternion = (1, 0, 0, 0)
 tare_quaternion = None
@@ -38,16 +43,81 @@ sources = [
     {"name":"Coop",  "pos":np.array([1.41, 1.41, 0.]),  "file":"cooper.mp3"}
 ]
 
-audio = []
+# ============================================================
+# AUDIO NORMALIZATION & INGESTION HELPERS (NumPy equivalents)
+# ============================================================
+def rms(x):
+    """Calculates the Root Mean Square of a NumPy array."""
+    return np.sqrt(np.mean(x**2) + 1e-9)
+
+def normalize_rms(x, target=0.1):
+    """Normalizes a NumPy array to a specific target RMS value."""
+    return x * (target / (rms(x) + 1e-9))
+
+raw_audio_tracks = []
+sample_rates = []
+
+# Phase 1: Load and convert to mono
 for s in sources:
     x, fs = sf.read(s["file"], dtype="float32")
-    if x.ndim > 1: x = x.mean(axis=1)
+    # Force Mono if the track contains multiple channels
+    if x.ndim > 1: 
+        x = x.mean(axis=1)
+    raw_audio_tracks.append(x)
+    sample_rates.append(fs)
+
+# Set the system master sampling rate using the first file
+FS = sample_rates[0]
+
+# Phase 2: Resample tracks if their native sample rates differ
+resampled_audio_tracks = []
+for x, fs in zip(raw_audio_tracks, sample_rates):
+    if fs != FS:
+        num_samples = int(len(x) * FS / fs)
+        x = resample(x, num_samples).astype(np.float32)
+    resampled_audio_tracks.append(x)
+
+# Phase 3: Match lengths across files to keep loops synchronized
+target_length = min(len(a) for a in resampled_audio_tracks)
+
+audio = []
+for x in resampled_audio_tracks:
+    # Crop if longer, or pad with zeros if shorter
+    if len(x) > target_length:
+        x = x[:target_length]
+    elif len(x) < target_length:
+        x = np.pad(x, (0, target_length - len(x)), mode='constant')
+        
+    # Normalize track energy to a standard baseline RMS
+    x = normalize_rms(x, target=0.1)
     audio.append(x)
 
-FS = fs
+print(f"Audio normalization complete. Track lengths synchronized to {target_length / FS:.2f} seconds at {FS}Hz.")
+
 positions = [0 for _ in sources]
 MAX_ITD = 0.0007
 MAX_SHIFT_SAMPLES = int(math.ceil(MAX_ITD * FS)) + 2
+
+
+# ============================================================
+# BACKGROUND RECORDING SETUP
+# ============================================================
+audio_queue = queue.Queue()
+
+def record_worker():
+    """Background thread worker that writes audio chunks from the queue to disk."""
+    with sf.SoundFile(RECORDING_FILENAME, mode='w', samplerate=FS, channels=2, subtype='PCM_16') as f:
+        while True:
+            data = audio_queue.get()
+            if data is None:  # Sentinel value to signal stop
+                break
+            f.write(data)
+            audio_queue.task_done()
+
+# Start the recording thread
+record_thread = threading.Thread(target=record_worker, daemon=True)
+record_thread.start()
+
 
 # ============================================================
 # AUDIO CALLBACK
@@ -63,7 +133,7 @@ def audio_callback(outdata, frames, time, status):
         alpha = 0.98
         attention_data = aar_core.compute_attention(latest_quaternion, sources, REFERENCE_DISTANCE, ATTENTION_SIGMA, ATTENTION_BOOST_DB)
 
-        # Unpack the new 5-element tuple, we only need the first two for audio
+        # Unpack the 5-element tuple for real-time spatial processing
         for i, (name, target_gain, _, _, _) in enumerate(attention_data):
             
             prev_gain = audio_callback.prev_gain[i]
@@ -87,7 +157,12 @@ def audio_callback(outdata, frames, time, status):
 
         peak = np.max(np.abs(mix))
         if peak > 1: mix /= peak
+        
+        # 1. Deliver to audio hardware
         outdata[:] = mix
+        
+        # 2. Push a copy to the recording queue safely
+        audio_queue.put(mix.copy())
 
     except Exception as e:
         print("\nAudio error:", e)
@@ -109,15 +184,12 @@ def notification_handler(sender, data):
     q = aar_core.quaternion_multiply(tare_quaternion, q_raw)
     latest_quaternion = q
 
-
     attention_data = aar_core.compute_attention(q, sources, REFERENCE_DISTANCE, ATTENTION_SIGMA, ATTENTION_BOOST_DB)
     text = []
 
     for name, final_gain, att_pct, dist_factor, target_db in attention_data:
-        # Formatting: Name | Distance Multiplier | AAR Boost (dB) | Final Multiplier
         text.append(f"{name}: Dist x{dist_factor:.2f} | AAR {target_db:>+5.1f}dB | Total x{final_gain:.3f}")
 
-    # Separating sources with a double pipe for clarity
     print("\r" + " || ".join(text), end="")
 
 # ============================================================
@@ -125,7 +197,7 @@ def notification_handler(sender, data):
 # ============================================================
 async def find_device():
     print("Scanning for BLE devices...\n")
-    devices = await BleakScanner.discover(timeout=5.0)
+    devices = await BleakScanner.discover(timeout=10.0)
 
     for d in devices:
         if d.name and DEVICE_NAME in d.name:
@@ -192,5 +264,16 @@ loop.create_task(ble_task())
 stream = sd.OutputStream(samplerate=FS, channels=2, callback=audio_callback, blocksize=512)
 stream.start()
 
-with loop:
-    loop.run_forever()
+# Wrapped event loop in a try/finally block to guarantee clean file closure on application exit
+try:
+    with loop:
+        loop.run_forever()
+finally:
+    print("\n\nClosing application... Finalizing audio recording.")
+    stream.stop()
+    stream.close()
+    
+    # Send sentinel token to cleanly break the background recording loop
+    audio_queue.put(None)
+    record_thread.join()
+    print(f"Recording successfully saved to: {RECORDING_FILENAME}")
